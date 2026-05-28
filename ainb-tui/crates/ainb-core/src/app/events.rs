@@ -383,7 +383,7 @@ fn source_provenance(
 /// Compute a stable display label for a `RepoSource` — drives the Configure
 /// screen's title bar and the persistence key in `session-defaults.yaml`.
 /// Phase 5 (new-session redesign).
-fn derive_repo_label(source: &crate::git::repo_source::RepoSource) -> String {
+pub fn derive_repo_label(source: &crate::git::repo_source::RepoSource) -> String {
     use crate::git::repo_source::RepoSource;
     match source {
         RepoSource::LocalPath(p) => p
@@ -1276,7 +1276,22 @@ impl EventHandler {
                 .unwrap_or(PickRepoOutcome::Stay);
 
             return match outcome {
-                PickRepoOutcome::Stay => None,
+                PickRepoOutcome::Stay => {
+                    // Check if the key handler set git_auth_status to
+                    // Checking (user pressed Enter to retry auth).
+                    use crate::components::new_session::pick_repo::GitAuthStatus;
+                    let needs_recheck = state
+                        .new_session_state
+                        .as_ref()
+                        .and_then(|ns| ns.pick_repo_state.as_ref())
+                        .and_then(|p| p.git_auth_status.as_ref())
+                        == Some(&GitAuthStatus::Checking);
+                    if needs_recheck {
+                        state.pending_async_action =
+                            Some(AsyncAction::CheckGitAuth);
+                    }
+                    None
+                }
                 PickRepoOutcome::BackToHome => {
                     // Persist session-defaults at the screen boundary
                     // (finding #3) so arrow/Esc no longer write on every
@@ -1305,74 +1320,34 @@ impl EventHandler {
                     state.current_screen = prev;
                     None
                 }
-                PickRepoOutcome::AdvanceTo(source)
-                | PickRepoOutcome::StartClone(source) => {
-                    // Phase 5: transition into Configure. StartClone for now
-                    // skips the real async clone (Phase 6+ wires it) and
-                    // advances straight in — the tripwires don't depend on
-                    // network I/O. Build `configure_state` from `source` +
-                    // session-defaults, set step = Configure.
-                    //
-                    // The dispatcher (not the UI layer) computes:
-                    //   - the HEAD branch via `git::repo_source::head_branch`
-                    //     (finding #9 — keeps git2 out of components/);
-                    //   - the configured `branch_prefix` (finding #5);
-                    //   - the existing-branch list for collision-disamb
-                    //     (finding #16).
-                    // PickRepo persistence (finding #3): write
-                    // session-defaults ONCE here, not on every arrow keypress.
-                    use crate::components::new_session::configure::ConfigureState;
-                    use crate::config::session_defaults::SessionDefaults;
-                    use crate::git::repo_source::head_branch;
-                    use crate::git::worktree_manager::WorktreeManager;
-                    if let Some(pick) = state
-                        .new_session_state
-                        .as_ref()
-                        .and_then(|ns| ns.pick_repo_state.as_ref())
-                    {
-                        let path = SessionDefaults::default_path();
-                        if let Err(err) = pick.defaults.save_to(&path) {
-                            tracing::warn!(error = %err, "PickRepo advance: persist session-defaults failed");
-                        }
-                    }
-                    let defaults =
-                        SessionDefaults::load_from(&SessionDefaults::default_path());
-                    let label = derive_repo_label(&source);
-                    let branch_source = match &source {
-                        crate::git::repo_source::RepoSource::LocalPath(p) => head_branch(p),
-                        _ => None,
-                    };
-                    let branch_prefix = state
-                        .app_config
-                        .workspace_defaults
-                        .branch_prefix
-                        .clone();
-                    // Use `list_all_worktrees` (scans by-session symlinks →
-                    // real git branch via head.shorthand()), NOT
-                    // `list_worktrees` which only finds legacy UUID-named
-                    // top-level dirs and misses every modern by-name worktree.
-                    // The latter returned empty → collision never detected
-                    // (Stevie 2026-05-27: feat/blog re-launch slipped through).
-                    let existing_branches: Vec<String> = WorktreeManager::new()
-                        .ok()
-                        .and_then(|m| m.list_all_worktrees().ok())
-                        .map(|infos| {
-                            infos.into_iter().map(|(_, i)| i.branch_name).collect()
-                        })
-                        .unwrap_or_default();
-                    let cfg = ConfigureState::from_pick_repo(
-                        source.clone(),
-                        label,
-                        &defaults,
-                        branch_source,
-                        &branch_prefix,
-                        existing_branches,
+                PickRepoOutcome::AdvanceTo(source) => {
+                    state.advance_pick_repo_to_configure(source);
+                    None
+                }
+                PickRepoOutcome::StartClone(source) => {
+                    // For HTTPS / GitHub sources, pre-check auth before
+                    // advancing — git credential prompts hang the TUI.
+                    use crate::components::new_session::pick_repo::GitAuthStatus;
+                    let needs_auth_check = matches!(
+                        &source,
+                        crate::git::repo_source::RepoSource::HttpsUrl(_)
+                            | crate::git::repo_source::RepoSource::GithubShorthand { .. }
                     );
-                    if let Some(ns) = state.new_session_state.as_mut() {
-                        ns.configure_state = Some(cfg);
-                        ns.step = NewSessionStep::Configure;
+                    if needs_auth_check {
+                        if let Some(pick) = state
+                            .new_session_state
+                            .as_mut()
+                            .and_then(|ns| ns.pick_repo_state.as_mut())
+                        {
+                            pick.git_auth_status = Some(GitAuthStatus::Checking);
+                            pick.pending_clone_source = Some(source);
+                        }
+                        state.pending_async_action =
+                            Some(AsyncAction::CheckGitAuth);
+                    } else {
+                        // SSH URLs use key-based auth — skip the check.
+                        state.advance_pick_repo_to_configure(source);
                     }
-                    tracing::debug!(?source, "PickRepo advance → Configure");
                     None
                 }
             };
